@@ -176,3 +176,5 @@ cython_debug/
 # Custom
 *.csv
 *.png
+*.parquet
+simulation_results/*

@@ -1,14 +1,15 @@
 # Source: https://matplotlib.org/stable/gallery/images_contours_and_fields/image_annotated_heatmap.html
 
-from typing import Callable, Mapping, Literal
+from typing import Callable, Literal
 import numpy as np
 import matplotlib.pyplot as plt
 import logging
 import scipy.stats as ss
 from dataclasses import dataclass
+from functools import cache
 
 
-def heatmap(data, row_labels, col_labels, ax=None,
+def heatmap(data, row_labels=None, col_labels=None, ax=None,
             cbar_kw=None, cbarlabel="", fontsize='medium', **kwargs):
     """
     Create a heatmap from a numpy array and two lists of labels.
@@ -46,11 +47,13 @@ def heatmap(data, row_labels, col_labels, ax=None,
     cbar.ax.set_ylabel(cbarlabel, rotation=-90, va="bottom")
 
     # Show all ticks and label them with the respective list entries.
-    ax.set_xticks(range(data.shape[1]), labels=col_labels,
-                  size=fontsize,
-                  rotation=-30, ha="right", rotation_mode="anchor")
-    ax.set_yticks(range(data.shape[0]), labels=row_labels,
-                  size=fontsize)
+    if col_labels is not None:
+        ax.set_xticks(range(data.shape[1]), labels=col_labels,
+                      size=fontsize,
+                      rotation=-30, ha="right", rotation_mode="anchor")
+    if row_labels is not None:
+        ax.set_yticks(range(data.shape[0]), labels=row_labels,
+                      size=fontsize)
 
     # Let the horizontal axes labeling appear on top.
     ax.tick_params(top=True, bottom=False,
@@ -75,41 +78,22 @@ class LSTSQStationaryDistributionReport:
     singular_values: np.ndarray
 
 
-class MarkovChain:
+class DiscreteMarkovChain:
     def __init__(self,
-                 transition_function: Callable[[int], int],
-                 initial_state: int = 0):
+                 transition_function: Callable[[int], int]):
         self.transition_function = transition_function
-        self._initial_state = -1
-        self.initial_state = initial_state
 
-    def update_state(self):
-        self.current_state = self.transition_function(self.current_state)
-
-    @property
-    def initial_state(self):
-        return self._initial_state
-
-    @initial_state.setter
-    def initial_state(self, value: int):
-        if value < 0:
-            raise ValueError("Initial state must be a non-negative integer.")
-        self._initial_state = value
-        self.current_state = value
+    def update_state(self, current_state: int) -> int:
+        self.current_state = self.transition_function(current_state)
 
 
-class KnownFiniteMarkovChain(MarkovChain):
+class DiscreteFiniteMarkovChain(DiscreteMarkovChain):
     def __init__(self,
-                 transition_matrix: np.ndarray,
-                 states_labels: Mapping[int, str] | None = None):
+                 transition_matrix: np.ndarray):
         self.transition_matrix = transition_matrix
         self.n_states = transition_matrix.shape[0]
-        if states_labels is None:
-            self.states_labels = {i: str(i) for i in range(self.n_states)}
-        else:
-            self.states_labels = states_labels
 
-        super().__init__(self.transition_function, current_state=0)
+        super().__init__(self.transition_function)
 
     def __repr__(self):
         return f"KnownFiniteMarkovChain(n_states={self.n_states})"
@@ -126,15 +110,22 @@ class KnownFiniteMarkovChain(MarkovChain):
             p=self.transition_matrix[current_state]
         )
 
+    def update_distribution(self, current_state_distribution: np.ndarray) -> np.ndarray:
+        """
+        Update the state distribution based on the current state distribution
+        and the transition matrix.
+        """
+        return current_state_distribution @ self.transition_matrix
+
     @property
     def lstsq_distribution(self) -> np.ndarray:
-        if not hasattr(self, '_slstsq_distribution'):
+        if not hasattr(self, '_lstsq_distribution'):
             self._compute_lstsq_statationary_distribution()
         return self._lstsq_distribution
 
     @property
-    def _lstsq_report(self) -> LSTSQStationaryDistributionReport:
-        if not hasattr(self, '_stationary_distribution_report'):
+    def lstsq_report(self) -> LSTSQStationaryDistributionReport:
+        if not hasattr(self, '_lstsq_report'):
             self._compute_lstsq_statationary_distribution()
         return self._lstsq_report
 
@@ -145,24 +136,23 @@ class KnownFiniteMarkovChain(MarkovChain):
         return self._expected_stationary_state
 
     def _compute_lstsq_statationary_distribution(self):
-        n_states = self.transition_matrix.shape[0]
         # Solve the equation πP = π
         # where sum(π) = 1
         A = np.vstack((self.transition_matrix.T -
-                      np.eye(n_states), np.ones((1, n_states))))
-        b = np.zeros(n_states + 1)
+                      np.eye(self.n_states), np.ones((1, self.n_states))))
+        b = np.zeros(self.n_states + 1)
         b[-1] = 1
-        res = np.linalg.lstsq(A, b, rcond=0)[0]
-        self._stationary_distribution = res[0].flatten()
-        self.__lstsq_report = LSTSQStationaryDistributionReport(
-            distribution=self._stationary_distribution,
+        res = np.linalg.lstsq(A, b, rcond=0)
+        self._lstsq_distribution = res[0].flatten()
+        self._lstsq_report = LSTSQStationaryDistributionReport(
+            distribution=self._lstsq_distribution,
             residuals=res[1],
             rank=res[2],
             singular_values=res[3],
         )
         self._expected_stationary_state = np.dot(
-            np.arange(n_states),
-            self._stationary_distribution
+            np.arange(self.n_states),
+            self._lstsq_distribution
         )
 
     @property
@@ -253,82 +243,67 @@ class KnownFiniteMarkovChain(MarkovChain):
         else:
             return transition_counter, np.array(variation_path)
 
-    def simulate(self, initial_state: int | str, n_steps: int,
-                 return_trajectory: bool = True) -> np.ndarray:
-        """
-        Simulate this Markov chain.
 
-        Parameters
-        ----------
-        initial_state : int | str
-            The initial state of the Markov chain.
-        n_steps : int
-            The number of steps to simulate.
-
-        Returns
-        -------
-        state_trajectory : list
-            A list of states visited during the simulation.
-        """
-        if return_trajectory:
-            state_trajectory = [initial_state]
-        if isinstance(initial_state, str):
-            initial_state = self.states_labels[initial_state]
-        current_state = initial_state
-        states = np.arange(self.n_states)
-
-        for _ in range(n_steps):
-            current_state = np.random.choice(
-                states,
-                p=self.transition_matrix[current_state]
-            )
-            if return_trajectory:
-                state_trajectory.append(current_state)
-
-        return np.array(state_trajectory)
-
-
-class MarkovChainQueueModel(KnownFiniteMarkovChain):
+class TimeContinuousMarkovChainQueueModel(DiscreteMarkovChain):
 
     def __init__(self,
                  producer_lambda: float,
                  consumer_lambda: float,
-                 queue_size: int):
+                 size: int,
+                 time_step: float = 1.0):
         self.producer_lambda = producer_lambda
         self.consumer_lambda = consumer_lambda
-        self.queue_size = queue_size
+        self.size = size
+        self.time_step = time_step
 
-        self.produced_items = ss.poisson(self.producer_lambda)
-        self.consumed_items = ss.poisson(self.consumer_lambda)
-        self.liquid_items = ss.skellam(self.producer_lambda,
-                                       self.consumer_lambda)
+        self.produced_items = ss.poisson(self.time_step*self.producer_lambda)
+        self.consumed_items = ss.poisson(self.time_step*self.consumer_lambda)
+        self.liquid_items = ss.skellam(self.time_step*self.producer_lambda,
+                                       self.time_step*self.consumer_lambda)
         self.producer_time = ss.expon(scale=1/self.producer_lambda)
         self.consumer_time = ss.expon(scale=1/self.consumer_lambda)
 
-        self.gamma_distributions = [
-            ss.gamma(a, scale=1/self.producer_lambda)
-            for a in range(self.queue_size + 1)
-        ]
-        self._lambda_sum = self.producer_lambda + self.consumer_lambda
-        self.increase_prob = self.consumer_lambda/self._lambda_sum
-        self.decrease_prob = self.producer_lambda / self._lambda_sum
+        lambda_sum = self.producer_lambda + self.consumer_lambda
+        self.increase_prob = self.producer_lambda / lambda_sum
+        self.decrease_prob = self.consumer_lambda / lambda_sum
         self.lambda_rate = self.producer_lambda / self.consumer_lambda
 
-        super().__init__(self._get_transition_matrix())
+        self.stationary_distribution = self._compute_stationary_distribution()
+        self.expected_size = np.dot(
+            np.arange(self.size + 1),
+            self.stationary_distribution
+        )
+        self.effective_producer_lambda = self.producer_lambda*(
+            1 - self.stationary_distribution[-1])
+        self.expected_wait_time = self.expected_size / self.effective_producer_lambda
+        self.transition_matrix = self._compute_transition_matrix()
 
-    def _get_transition_matrix(self):
+        self.discrete = DiscreteFiniteMarkovChain(
+            self._get_discrete_transition_matrix()
+        )
+        super().__init__(self.discrete.transition_function)
+
+    def _compute_stationary_distribution(self):
         """
-        Create the transition matrix for the Markov chain.
-        The transition matrix is a square matrix of size (queue_size + 1)
-        where each row corresponds to a state and each column corresponds
-        to a possible next state.
+        Compute the continuous stationary distribution of the Markov chain.
+        The continuous stationary distribution is a vector of size (size + 1)
+        where each element corresponds to the probability of being in that state.
         """
+        if self.lambda_rate == 1:
+            pi_zero = 1 / (self.size + 1)
+        else:
+            pi_zero = (1-self.lambda_rate) / \
+                (1 - (self.lambda_rate**(self.size + 1)))
+
+        return pi_zero * np.power(self.lambda_rate, np.arange(self.size + 1))
+
+    def _compute_transition_matrix(self):
         transition_matrix = np.zeros(
-            (self.queue_size + 1, self.queue_size + 1))
+            (self.size + 1, self.size + 1))
 
-        for i in range(self.queue_size + 1):
+        for i in range(self.size + 1):
             # Probability of increasing the queue size
-            if i <= self.queue_size:
+            if i < self.size:
                 transition_matrix[i, i + 1] = self.increase_prob
             else:
                 transition_matrix[i, i] = self.increase_prob
@@ -341,6 +316,73 @@ class MarkovChainQueueModel(KnownFiniteMarkovChain):
 
         return transition_matrix
 
+    def _get_discrete_transition_matrix(self):
+        """
+        Create the transition matrix for the Markov chain.
+        The transition matrix is a square matrix of size (size + 1)
+        where each row corresponds to a state and each column corresponds
+        to a possible next state.
+        """
+        transition_matrix = np.zeros(
+            (self.size + 1, self.size + 1))
+
+        for i in range(self.size + 1):
+            transition_matrix[i, 0] = self.liquid_items.cdf(-i)
+            transition_matrix[i, self.size] = 1 - \
+                self.liquid_items.cdf(self.size - i - 1)
+            transition_matrix[i, 1:self.size] = self.liquid_items.pmf(
+                np.arange(1-i, self.size-i))
+
+        return transition_matrix
+
 
 def total_variation(u, v):
     return .5*np.sum(np.abs(u-v))
+
+
+def operation_profit(
+    infra_costs: float,
+    reject_prob: float,
+    wait_time: float,
+    producer_lambda: float,
+    customer_revenue: float,
+    wait_time_cost: float,
+):
+    revenue = customer_revenue*producer_lambda*(1 - reject_prob)
+    costs = infra_costs + wait_time_cost*wait_time
+    return revenue - costs
+
+
+def infra_lambda(
+    machines: np.ndarray,
+    machines_lambda: np.ndarray
+) -> float:
+    """
+    Calculate the total lambda of the infrastructure based on the number of machines
+    and their individual lambda values.
+    """
+    return np.dot(machines, machines_lambda)
+
+
+def infra_cost(
+    machines: np.ndarray,
+    operation_cost: np.ndarray
+) -> float:
+    """
+    Calculate the total cost of the infrastructure based on the number of machines
+    and their individual operation costs.
+    """
+    return np.dot(machines, operation_cost)
+
+
+@cache
+def get_cached_queue_model(producer_lambda: float,
+                           consumer_lambda: float,
+                           queue_size: int,
+                           discrete_time_step: float = 0.01) -> TimeContinuousMarkovChainQueueModel:
+    return TimeContinuousMarkovChainQueueModel(
+        producer_lambda=producer_lambda,
+        consumer_lambda=consumer_lambda,
+        size=queue_size,
+        time_step=discrete_time_step
+    )
