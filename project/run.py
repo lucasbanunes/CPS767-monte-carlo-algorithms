@@ -145,7 +145,8 @@ profits: List[float] = []
 
 while current_step < max_steps and (cooldown > current_step or current_variation > epsilon):
 
-    print(f'Running step {current_step}, time {current_time}, variation {current_variation}')
+    print(
+        f'Running step {current_step}, time {current_time}, variation {current_variation}')
     times.append(current_time)
     current_producer_lambda = get_producer_lambda(current_time)
     processing_machines = get_processing_machines(current_time)
@@ -216,7 +217,8 @@ result_df = dict(
     profit=profits
 )
 
-output_dir = Path(f'/home/lucasbanunes/workspaces/monte-carlo-cps767/CPS767-monte-carlo-algorithms/project/simulation_results/{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
+output_dir = Path(
+    f'/home/lucasbanunes/workspaces/monte-carlo-cps767/CPS767-monte-carlo-algorithms/project/simulation_results/{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
 output_dir.mkdir(parents=True, exist_ok=True)
 result_df = pd.DataFrame.from_dict(result_df)
 output_file = output_dir / 'data.parquet'

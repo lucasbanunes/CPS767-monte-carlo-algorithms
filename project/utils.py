@@ -1,18 +1,19 @@
-# Source: https://matplotlib.org/stable/gallery/images_contours_and_fields/image_annotated_heatmap.html
-
-from typing import Callable, Literal
+from typing import Callable, List, Tuple
 import numpy as np
 import matplotlib.pyplot as plt
 import logging
 import scipy.stats as ss
 from dataclasses import dataclass
-from functools import cache
+from functools import cache, partial
+from scipy.optimize import minimize
+import pandas as pd
 
 
 def heatmap(data, row_labels=None, col_labels=None, ax=None,
             cbar_kw=None, cbarlabel="", fontsize='medium', **kwargs):
     """
     Create a heatmap from a numpy array and two lists of labels.
+    https://matplotlib.org/stable/gallery/images_contours_and_fields/image_annotated_heatmap.html
 
     Parameters
     ----------
@@ -71,180 +72,152 @@ def heatmap(data, row_labels=None, col_labels=None, ax=None,
 
 
 @dataclass(frozen=True)
-class LSTSQStationaryDistributionReport:
-    distribution: np.ndarray
+class LSTSQReport:
+    stationary_distribution: np.ndarray
+    reject_prob: float
     residuals: np.ndarray
     rank: int
     singular_values: np.ndarray
+    expected_stationary_state: float
+    expected_wait_time: float
+    effective_producer_lambda: float
 
-
-class DiscreteMarkovChain:
-    def __init__(self,
-                 transition_function: Callable[[int], int]):
-        self.transition_function = transition_function
-
-    def update_state(self, current_state: int) -> int:
-        self.current_state = self.transition_function(current_state)
-
-
-class DiscreteFiniteMarkovChain(DiscreteMarkovChain):
-    def __init__(self,
-                 transition_matrix: np.ndarray):
-        self.transition_matrix = transition_matrix
-        self.n_states = transition_matrix.shape[0]
-
-        super().__init__(self.transition_function)
-
-    def __repr__(self):
-        return f"KnownFiniteMarkovChain(n_states={self.n_states})"
-
-    def transition_function(self, current_state: int) -> int:
-        """
-        Transition function for the Markov chain.
-        Returns the next state based on the current state.
-        """
-        if isinstance(current_state, str):
-            current_state = self.states_labels[current_state]
-        return np.random.choice(
-            self.n_states,
-            p=self.transition_matrix[current_state]
-        )
-
-    def update_distribution(self, current_state_distribution: np.ndarray) -> np.ndarray:
-        """
-        Update the state distribution based on the current state distribution
-        and the transition matrix.
-        """
-        return current_state_distribution @ self.transition_matrix
-
-    @property
-    def lstsq_distribution(self) -> np.ndarray:
-        if not hasattr(self, '_lstsq_distribution'):
-            self._compute_lstsq_statationary_distribution()
-        return self._lstsq_distribution
-
-    @property
-    def lstsq_report(self) -> LSTSQStationaryDistributionReport:
-        if not hasattr(self, '_lstsq_report'):
-            self._compute_lstsq_statationary_distribution()
-        return self._lstsq_report
-
-    @property
-    def expected_stationary_state(self):
-        if not hasattr(self, '_expected_stationary_state'):
-            self._compute_lstsq_statationary_distribution()
-        return self._expected_stationary_state
-
-    def _compute_lstsq_statationary_distribution(self):
-        # Solve the equation πP = π
-        # where sum(π) = 1
-        A = np.vstack((self.transition_matrix.T -
-                      np.eye(self.n_states), np.ones((1, self.n_states))))
-        b = np.zeros(self.n_states + 1)
+    @classmethod
+    def from_transition_matrix(cls,
+                               transition_matrix: np.ndarray,
+                               producer_lambda: float) -> 'LSTSQReport':
+        n_states = len(transition_matrix)
+        A = np.vstack(
+            (transition_matrix - np.eye(n_states), np.ones((1, n_states))))
+        b = np.zeros(n_states + 1)
         b[-1] = 1
         res = np.linalg.lstsq(A, b, rcond=0)
-        self._lstsq_distribution = res[0].flatten()
-        self._lstsq_report = LSTSQStationaryDistributionReport(
-            distribution=self._lstsq_distribution,
+        stationary_distribution = res[0].flatten()
+        expected_stationary_state = np.dot(
+            np.arange(len(stationary_distribution)), stationary_distribution
+        )
+        reject_prob = stationary_distribution[-1]
+        effective_producer_lambda = producer_lambda * (1 - reject_prob)
+        expected_wait_time = expected_stationary_state / effective_producer_lambda
+        return cls(
+            stationary_distribution=stationary_distribution,
+            reject_prob=stationary_distribution[-1],
             residuals=res[1],
             rank=res[2],
             singular_values=res[3],
+            expected_stationary_state=expected_stationary_state,
+            expected_wait_time=expected_wait_time,
+            effective_producer_lambda=effective_producer_lambda
         )
-        self._expected_stationary_state = np.dot(
-            np.arange(self.n_states),
-            self._lstsq_distribution
+
+
+@dataclass(frozen=True)
+class EigenvaluesReport:
+    eigenvalues: np.ndarray
+    eigenvectors: np.ndarray
+    spectral_gap: float
+    stationary_distribution: np.ndarray
+    reject_prob: float
+    expected_stationary_state: float
+    expected_wait_time: float
+    effective_producer_lambda: float
+
+    @classmethod
+    def from_values_vectors(cls,
+                            eigenvalues: np.ndarray,
+                            eigenvectors: np.ndarray,
+                            producer_lambda: float) -> 'EigenvaluesReport':
+        sortidx = np.argsort(np.abs(eigenvalues))[::-1]
+        eigenvalues = eigenvalues[sortidx]
+        eigenvectors = eigenvectors[:, sortidx]
+        spectral_gap = 1 - np.abs(eigenvalues[1])
+        stationary_distribution = eigenvectors[:, 0]
+        if np.all(stationary_distribution < 0):
+            stationary_distribution = -stationary_distribution
+        stationary_distribution /= np.sum(stationary_distribution**2)
+        expected_stationary_state = np.dot(
+            np.arange(len(stationary_distribution)), stationary_distribution
+        )
+        reject_prob = stationary_distribution[-1]
+        effective_producer_lambda = producer_lambda * (1 - reject_prob)
+        expected_wait_time = expected_stationary_state / effective_producer_lambda
+
+        return cls(
+            eigenvalues=eigenvalues,
+            eigenvectors=eigenvectors,
+            spectral_gap=spectral_gap,
+            stationary_distribution=stationary_distribution,
+            reject_prob=reject_prob,
+            expected_stationary_state=expected_stationary_state,
+            expected_wait_time=expected_wait_time,
+            effective_producer_lambda=effective_producer_lambda
         )
 
-    @property
-    def spectral_gap(self):
-        if not hasattr(self, '_gap'):
-            self._compute_spectral_gap()
-        return self._spectral_gap
+
+class MarkovChainQueueModel:
 
     @property
-    def eigenvalues(self):
-        if not hasattr(self, '_eigenvalues'):
-            self._compute_spectral_gap()
-        return self._eigenvalues
-
-    @property
-    def eigenvectors(self):
-        if not hasattr(self, '_eigenvectors'):
-            self._compute_spectral_gap()
-        return self._eigenvectors
-
-    @property
-    def eigenvector_stationary(self):
+    def eigenvalues_report(self) -> EigenvaluesReport:
         """
-        Compute the stationary distribution using the eigenvector method.
-        The stationary distribution is the normalized eigenvector corresponding to the
-        eigenvalue 1 of the transition matrix.
+        Compute the eigenvalues and eigenvectors of the transition matrix.
+        The stationary distribution is computed as the normalized eigenvector
+        corresponding to the eigenvalue 1.
         """
-        if not hasattr(self, '_eigenvector_stationary'):
-            self._compute_spectral_gap()
-        return self._eigenvector_stationary
-
-    def _compute_spectral_gap(self):
-        # Get the eigenvalues of the Markov matrix
-        self._eigenvalues, self._eigenvectors = np.linalg.eig(
-            self.transition_matrix)
-        sortidx = np.argsort(np.abs(self._eigenvalues))[::-1]
-        self._eigenvalues = self._eigenvalues[sortidx]
-        self._eigenvectors = self._eigenvectors[:, sortidx]
-        abs_eigenvalues = np.abs(self._eigenvalues)
-        self._spectral_gap = 1 - abs_eigenvalues[1]
-        self._eigenvector_stationary = self._eigenvectors[:, 0]
-        self._eigenvector_stationary /= np.sum(self._eigenvector_stationary**2)
-
-    def compute_mixture_time(self, epsilon, n_steps=10000,
-                             return_type: Literal['time', 'max_path', 'all_paths'] = 'time'):
-        logging.info('Computing the mixture time')
-        current_state_distribution = np.eye(self.n_states)
-        transition_counter = 0
-        stationary_matrix = [
-            self.stationary_distribution for _ in range(self.n_states)
-        ]
-        stationary_matrix = np.array(stationary_matrix)
-        current_variations = 0.5*np.sum(
-            np.abs(current_state_distribution - stationary_matrix),
-            axis=1
-        )
-        return_is_max = return_type == 'max_path'
-        return_is_all = return_type == 'all_paths'
-        if return_is_max:
-            variation_path = [max(current_variations)]
-        elif return_is_all:
-            variation_path = [current_variations]
-
-        while np.all(current_variations > epsilon) and (transition_counter < n_steps):
-            # Compute the variation distance
-            # between the current state and the stationary distribution
-            transition_counter += 1
-            current_state_distribution = current_state_distribution @ self.transition_matrix
-            current_variations = 0.5*np.sum(
-                np.abs(current_state_distribution - stationary_matrix),
-                axis=1
+        if not hasattr(self, '_eigenvalues_report'):
+            eigenvalues, eigenvectors = np.linalg.eig(self.transition_matrix.T)
+            self._eigenvalues_report = EigenvaluesReport.from_values_vectors(
+                eigenvalues=eigenvalues,
+                eigenvectors=eigenvectors,
+                producer_lambda=self.producer_lambda
             )
-            if return_is_max:
-                variation_path.append(max(current_variations))
-            elif return_is_all:
-                variation_path.append(current_variations)
+        return self._eigenvalues_report
 
-        if transition_counter >= n_steps:
-            logging.warning("The Markov chain misture time did not converge"
-                            f" within {n_steps} iterations and epsilon={epsilon}.")
-        else:
-            logging.info(f"The Markov chain mixture time converged in "
-                         f"{transition_counter} iterations.")
-            return transition_counter, np.array(-1)
-
-        if return_type == 'time':
-            return transition_counter, None
-        else:
-            return transition_counter, np.array(variation_path)
+    @property
+    def lstsq_report(self) -> LSTSQReport:
+        if not hasattr(self, '_lstsq_report'):
+            self._lstsq_report = LSTSQReport.from_transition_matrix(
+                self.transition_matrix.T,
+                self.producer_lambda
+            )
+        return self._lstsq_report
 
 
-class TimeContinuousMarkovChainQueueModel(DiscreteMarkovChain):
+class DiscreteMarkovChainQueueModel(MarkovChainQueueModel):
+    def __init__(self,
+                 producer_lambda: float,
+                 consumer_lambda: float,
+                 size: int):
+        self.producer_lambda = producer_lambda
+        self.consumer_lambda = consumer_lambda
+        self.lambda_rate = self.producer_lambda / self.consumer_lambda
+        self.size = size
+        self.produced_items = ss.poisson(self.producer_lambda)
+        self.consumed_items = ss.poisson(self.consumer_lambda)
+        self.liquid_items = ss.skellam(self.producer_lambda,
+                                       self.consumer_lambda)
+        self.transition_matrix = self._compute_transition_matrix()
+
+    def _compute_transition_matrix(self):
+        transition_matrix = np.zeros(
+            (self.size + 1, self.size + 1))
+
+        for i in range(self.size + 1):
+            transition_matrix[i, 0] = self.liquid_items.cdf(-i)
+            transition_matrix[i, self.size] = 1 - \
+                self.liquid_items.cdf(self.size - i - 1)
+            transition_matrix[i, 1:self.size] = self.liquid_items.pmf(
+                np.arange(1-i, self.size-i))
+
+        return transition_matrix
+
+    def update_distribution(self, state_distribution: np.ndarray) -> np.ndarray:
+        """
+        Update the state distribution based on the transition matrix.
+        """
+        return state_distribution @ self.transition_matrix
+
+
+class TimeContinuousMarkovChainQueueModel(MarkovChainQueueModel):
 
     def __init__(self,
                  producer_lambda: float,
@@ -256,10 +229,6 @@ class TimeContinuousMarkovChainQueueModel(DiscreteMarkovChain):
         self.size = size
         self.time_step = time_step
 
-        self.produced_items = ss.poisson(self.time_step*self.producer_lambda)
-        self.consumed_items = ss.poisson(self.time_step*self.consumer_lambda)
-        self.liquid_items = ss.skellam(self.time_step*self.producer_lambda,
-                                       self.time_step*self.consumer_lambda)
         self.producer_time = ss.expon(scale=1/self.producer_lambda)
         self.consumer_time = ss.expon(scale=1/self.consumer_lambda)
 
@@ -278,10 +247,11 @@ class TimeContinuousMarkovChainQueueModel(DiscreteMarkovChain):
         self.expected_wait_time = self.expected_size / self.effective_producer_lambda
         self.transition_matrix = self._compute_transition_matrix()
 
-        self.discrete = DiscreteFiniteMarkovChain(
-            self._get_discrete_transition_matrix()
+        self.discrete = DiscreteMarkovChainQueueModel(
+            self.time_step*self.producer_lambda,
+            self.time_step*consumer_lambda,
+            self.size
         )
-        super().__init__(self.discrete.transition_function)
 
     def _compute_stationary_distribution(self):
         """
@@ -313,25 +283,6 @@ class TimeContinuousMarkovChainQueueModel(DiscreteMarkovChain):
                 transition_matrix[i, i - 1] = self.decrease_prob
             else:
                 transition_matrix[i, i] = self.decrease_prob
-
-        return transition_matrix
-
-    def _get_discrete_transition_matrix(self):
-        """
-        Create the transition matrix for the Markov chain.
-        The transition matrix is a square matrix of size (size + 1)
-        where each row corresponds to a state and each column corresponds
-        to a possible next state.
-        """
-        transition_matrix = np.zeros(
-            (self.size + 1, self.size + 1))
-
-        for i in range(self.size + 1):
-            transition_matrix[i, 0] = self.liquid_items.cdf(-i)
-            transition_matrix[i, self.size] = 1 - \
-                self.liquid_items.cdf(self.size - i - 1)
-            transition_matrix[i, 1:self.size] = self.liquid_items.pmf(
-                np.arange(1-i, self.size-i))
 
         return transition_matrix
 
@@ -386,3 +337,349 @@ def get_cached_queue_model(producer_lambda: float,
         size=queue_size,
         time_step=discrete_time_step
     )
+
+
+class PassThroughEstimator:
+    def __init__(self):
+        pass
+
+    def __call__(self, time: float, input_value: float) -> float:
+        return input_value
+
+
+class ProportionalGain:
+
+    def __init__(self,
+                 gain: float):
+        self.gain = gain
+
+    def __call__(self, time: float, input_value: float) -> float:
+        return self.gain * input_value
+
+
+class Profit:
+
+    def __init__(self,
+                 infra_cost: float,
+                 wait_time_cost: float,
+                 customer_revenue: float):
+        self.infra_cost = infra_cost
+        self.wait_time_cost = wait_time_cost
+        self.customer_revenue = customer_revenue
+
+    def __call__(self,
+                 consumer_lambda: float,
+                 effective_producer_lambda: float,
+                 expected_wait_time: float) -> float:
+        revenue = self.customer_revenue * effective_producer_lambda
+        cost = self.infra_cost * consumer_lambda + \
+            self.wait_time_cost * expected_wait_time
+        profit = revenue - cost
+        return profit, revenue, cost
+
+    def sample_computation(
+        self,
+        consumer_lambda: float,
+        new_clients: float,
+        expected_wait_time: float
+    ) -> float:
+        """
+        Sample computation of the profit function.
+        This is a simplified version that does not take into account the
+        infrastructure costs and the wait time costs.
+        """
+        revenue = self.customer_revenue * new_clients
+        cost = self.infra_cost * consumer_lambda + \
+            self.wait_time_cost * expected_wait_time
+        profit = revenue - cost
+        return profit, revenue, cost
+
+
+class MPCGainEstimator:
+
+    def __init__(self,
+                 n_steps: int,
+                 profit_function: Callable[[float, float, float], Tuple[float, float, float]],
+                 controller_class,
+                 queue_size: int,
+                 time_step: float):
+        self.n_steps = n_steps
+        self.profit_function = profit_function
+        self.controller_class = controller_class
+        self.queue_size = queue_size
+        self.time_step = time_step
+
+    def _cost_function(self,
+                       controller_params: np.ndarray,
+                       producer_lambda_hat: float,
+                       start_queue_size: int) -> float:
+        controller = self.controller_class(gain=controller_params[0])
+        queue_size_distribution = np.zeros(self.queue_size + 1)
+        queue_size_distribution[start_queue_size] = 1.0
+        current_queue_size_distribution = queue_size_distribution
+        estimated_cost = 0
+        estimated_revenue = 0
+        estimated_profit = 0
+        logging.debug(
+            f'Starting cost function computation with controller params: {controller_params}  for {self.n_steps} steps')
+        for current_step in range(self.n_steps):
+            logging.debug(f'Running step {current_step}')
+            current_time = current_step * self.time_step
+            consumer_lambda = controller(current_time, producer_lambda_hat)
+            queue_model = TimeContinuousMarkovChainQueueModel(
+                producer_lambda=producer_lambda_hat,
+                consumer_lambda=consumer_lambda,
+                size=self.queue_size,
+                time_step=self.time_step
+            )
+            reject_prob = current_queue_size_distribution[-1]
+            effective_producer_lambda_hat = producer_lambda_hat * \
+                (1 - reject_prob)
+            expected_queue_size = np.dot(
+                np.arange(self.queue_size + 1),
+                current_queue_size_distribution
+            )
+            expected_wait_time = expected_queue_size / effective_producer_lambda_hat
+            profit, revenue, cost = self.profit_function(
+                consumer_lambda, effective_producer_lambda_hat, expected_wait_time
+            )
+            estimated_profit += profit * self.time_step
+            estimated_revenue += revenue * self.time_step
+            estimated_cost += cost * self.time_step
+            current_queue_size_distribution =\
+                queue_model.discrete.update_distribution(
+                    current_queue_size_distribution)
+
+        return -estimated_profit
+
+    def __call__(self, time: float,
+                 producer_lambda_hat: float,
+                 current_gain: float,
+                 current_queue_size: int) -> float:
+
+        cost_function = partial(
+            self._cost_function,
+            producer_lambda_hat=producer_lambda_hat,
+            start_queue_size=current_queue_size
+        )
+        logging.debug(f'Runing optimization for time {time} with initial gain {current_gain}')
+        res = minimize(
+            cost_function,
+            x0=current_gain,
+            method='Nelder-Mead',
+            options={'xatol': 1e-8}
+        )
+        if not res.success:
+            logging.warning(
+                f"Optimization failed at time {time}: {res.message}")
+            return current_gain
+
+        controller = self.controller_class(res.x)
+        consumer_lambda = controller(time, producer_lambda_hat)
+
+        return consumer_lambda, res.x, -res.func
+
+
+# class Optimizer:
+
+#     def __init__(self,
+#                  seconds: float,
+#                  profit_function: Callable[[float, float, float], Tuple[float, float, float]],
+#                  controller_class,
+#                  queue_size: int,
+#                  time_step: float,
+#                  producer_lambda_function: Callable[[float], float],
+#                  producer_lambda_estimator: Callable[[float, float], float]):
+#         self.n_steps = seconds
+#         self.profit_function = profit_function
+#         self.controller_class = controller_class
+#         self.queue_size = queue_size
+#         self.time_step = time_step
+#         self.n_steps = int(seconds / time_step)
+#         self.producer_lambda_function = producer_lambda_function
+#         self.producer_lambda_estimator = producer_lambda_estimator
+        
+
+#     def cost_function(self,
+#                       controller_params: np.ndarray,
+#                       producer_lambda_estimator: float,
+#                       start_queue_size: int) -> float:
+#         controller = self.controller_class(gain=controller_params[0])
+#         queue_size_distribution = np.zeros(self.queue_size + 1)
+#         queue_size_distribution[start_queue_size] = 1.0
+#         current_queue_size_distribution = queue_size_distribution
+#         estimated_cost = 0
+#         estimated_revenue = 0
+#         estimated_profit = 0
+#         logging.debug(
+#             f'Starting cost function computation with controller params: {controller_params}  for {self.n_steps} steps')
+#         for current_step in range(self.n_steps):
+#             logging.debug(f'Running step {current_step}')
+#             current_time = current_step * self.time_step
+#             cur
+#             current_producer_lambda_hat = self.producer_lambda_estimator(time, )
+#             consumer_lambda = controller(current_time, producer_lambda_hat)
+#             queue_model = TimeContinuousMarkovChainQueueModel(
+#                 producer_lambda=producer_lambda_hat,
+#                 consumer_lambda=consumer_lambda,
+#                 size=self.queue_size,
+#                 time_step=self.time_step
+#             )
+#             reject_prob = current_queue_size_distribution[-1]
+#             effective_producer_lambda_hat = producer_lambda_hat * \
+#                 (1 - reject_prob)
+#             expected_queue_size = np.dot(
+#                 np.arange(self.queue_size + 1),
+#                 current_queue_size_distribution
+#             )
+#             expected_wait_time = expected_queue_size / effective_producer_lambda_hat
+#             profit, revenue, cost = self.profit_function(
+#                 consumer_lambda, effective_producer_lambda_hat, expected_wait_time
+#             )
+#             estimated_profit += profit * self.time_step
+#             estimated_revenue += revenue * self.time_step
+#             estimated_cost += cost * self.time_step
+#             current_queue_size_distribution =\
+#                 queue_model.discrete.update_distribution(
+#                     current_queue_size_distribution)
+
+#         return -estimated_profit
+
+#     def minimize(self, time: float,
+#                  producer_lambda_hat: float,
+#                  current_gain: float,
+#                  current_queue_size: int) -> float:
+
+#         cost_function = partial(
+#             self._cost_function,
+#             producer_lambda_hat=producer_lambda_hat,
+#             start_queue_size=current_queue_size
+#         )
+#         logging.debug(f'Runing optimization for time {time} with initial gain {current_gain}')
+#         res = minimize(
+#             cost_function,
+#             x0=current_gain,
+#             method='Nelder-Mead',
+#             options={'xatol': 1e-8}
+#         )
+#         if not res.success:
+#             logging.warning(
+#                 f"Optimization failed at time {time}: {res.message}")
+#             return current_gain
+
+#         controller = self.controller_class(res.x)
+#         consumer_lambda = controller(time, producer_lambda_hat)
+
+#         return consumer_lambda, res.x, -res.func
+
+
+class Simulation:
+    def __init__(self,
+                 initial_queue_size: int,
+                 queue_size: int,
+                 time_step: float,
+                 producer_lambda_function: Callable[[float], float],
+                 controller_window: float,
+                 infra_cost: float,
+                 wait_time_cost: float,
+                 customer_revenue: float,
+                 start_controller_gain: float = 1.0):
+        self.initial_queue_size = initial_queue_size
+        self.queue_size = queue_size
+        self.time_step = time_step
+        self.producer_lambda_function = producer_lambda_function
+        self.infra_cost = infra_cost
+        self.wait_time_cost = wait_time_cost
+        self.customer_revenue = customer_revenue
+        self.start_controller_gain = start_controller_gain
+        self.profit_function = Profit(
+            infra_cost=infra_cost,
+            wait_time_cost=wait_time_cost,
+            customer_revenue=customer_revenue
+        )
+        self.controller_steps = int(controller_window / time_step)
+        self.controller = MPCGainEstimator(
+            n_steps=self.controller_steps,
+            profit_function=self.profit_function,
+            controller_class=ProportionalGain,
+            queue_size=queue_size,
+            time_step=self.time_step
+        )
+
+        # Records
+        self.time: List[float] = []
+        self.queue_size: List[int] = []
+        self.producer_lambda: List[float] = []
+        self.producer_lambda_hat: List[float] = []
+        self.consumer_lambda: List[float] = []
+        self.expected_wait_time: List[float] = []
+        self.controller_gain: List[float] = []
+        self.profit: List[float] = []
+
+    def run(self, seconds: float):
+        current_step = 0
+        current_time = 0
+        current_queue_size = self.initial_queue_size
+        current_controller_gain = self.start_controller_gain
+
+        n_steps = int(seconds / self.time_step)
+        for current_step in range(n_steps):
+            current_time = current_step * self.time_step
+            logging.debug(f'{current_step} - Running time {current_time}')
+            self.time.append(current_time)
+
+            self.queue_size.append(current_queue_size)
+
+            current_producer_lambda = self.producer_lambda_function(
+                current_time)
+            self.producer_lambda.append(current_producer_lambda)
+            current_producer_lambda_hat = current_producer_lambda
+            self.producer_lambda_hat.append(current_producer_lambda_hat)
+
+            current_consumer_lambda, controller_params, profit = self.controller(
+                time=current_time,
+                producer_lambda_hat=current_producer_lambda_hat,
+                current_gain=current_controller_gain,
+                current_queue_size=current_queue_size)
+            current_controller_gain = controller_params[0]
+            self.consumer_lambda.append(current_consumer_lambda)
+            self.profit.append(profit)
+            expected_wait_time = current_queue_size / current_consumer_lambda
+            self.expected_wait_time.append(expected_wait_time)
+            self.controller_gain.append(current_controller_gain)
+
+            # new_clients = ss.poisson.rvs(
+            #     self.time_step * current_producer_lambda_hat, 1
+            # )
+            # processed_clients = ss.poisson.rvs(
+            #     self.time_step * current_consumer_lambda, 1
+            # )
+
+            # current_profit, current_revenue, current_cost = \
+            #     self.profit_function.sample_computation(
+            #         consumer_lambda=current_consumer_lambda,
+            #         effective_producer_lambda=current_producer_lambda_hat,
+            #         expected_wait_time=expected_wait_time
+            #     )
+
+            queue_model = get_cached_queue_model(
+                producer_lambda=current_producer_lambda,
+                consumer_lambda=current_consumer_lambda,
+                queue_size=self.queue_size
+            )
+
+            current_queue_size = queue_model.update_state(current_queue_size)
+
+    def dump_results(self, filename: str):
+        results_df = dict(
+            time=self.time,
+            queue_size=self.queue_size,
+            producer_lambda=self.producer_lambda,
+            producer_lambda_hat=self.producer_lambda_hat,
+            consumer_lambda=self.consumer_lambda,
+            expected_wait_time=self.expected_wait_time,
+            controller_gain=self.controller_gain,
+            profit=self.profit
+        )
+        results_df = pd.DataFrame.from_dict(results_df)
+        results_df.to_parquet(filename)
