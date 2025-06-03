@@ -1,56 +1,9 @@
-from argparse import ArgumentParser
-from utils import Simulation
+import numpy as np
+from utils import Optimizer
 from pathlib import Path
 from datetime import datetime
 import logging
 import logging.config
-
-
-def parse_args():
-
-    parser = ArgumentParser()
-
-    parser.add_argument('--seconds',
-                        required=True,
-                        type=float,
-                        help='Number of seconds to run the simulation')
-    parser.add_argument('--initial-size',
-                        required=True,
-                        type=int,
-                        dest='initial_size',
-                        help='Queue initial size')
-    parser.add_argument('--queue-size',
-                        required=True,
-                        type=int,
-                        dest='queue_size',
-                        help='Queue max size')
-    parser.add_argument('--time-step',
-                        required=True,
-                        type=float,
-                        dest='time_step',
-                        help='Simulation time step in seconds')
-    parser.add_argument('--window',
-                        required=True,
-                        type=float,
-                        dest='window',
-                        help='Simulation time step in seconds')
-    parser.add_argument('--infra-cost',
-                        required=True,
-                        type=float,
-                        dest='infra_cost',
-                        help='The infra cost multiplier')
-    parser.add_argument('--wait-time-cost',
-                        required=True,
-                        type=float,
-                        dest='wait_time_cost',
-                        help='The infra cost multiplier')
-    parser.add_argument('--customer-revenue',
-                        required=True,
-                        type=float,
-                        dest='costumer_revenue',
-                        help='Money earned per customer')
-
-    return parser.parse_args()
 
 
 def get_logging_config(log_level: str = 'DEBUG'):
@@ -82,31 +35,42 @@ def get_logging_config(log_level: str = 'DEBUG'):
 
 
 if __name__ == '__main__':
-    # args = parse_args()
-    # sim = Simulation(
-    #     initial_queue_size=args.initial_size,
-    #     queue_size=args.queue_size,
-    #     time_step=args.time_step,
-    #     producer_lambda_function=None,
-    #     controller_window=args.window,
-    #     infra_cost=args.infra_cost,
-    #     wait_time_cost=args.wait_time_cost,
-    #     customer_revenue=args.customer_revenue
-    # )
-    logging.config.dictConfig(get_logging_config())
+    logging.config.dictConfig(get_logging_config('INFO'))
     output_dir = Path(f'/home/lucasbanunes/workspaces/monte-carlo-cps767/CPS767-monte-carlo-algorithms/project/simulation_results/{datetime.now().strftime("%Y-%m-%d_%H-%M-%S")}')
     output_dir.mkdir(parents=True, exist_ok=True)
-    sim = Simulation(
-        initial_queue_size=0,
-        queue_size=100,
-        time_step=1e-3,
-        producer_lambda_function=lambda x: 10,
-        controller_window=1,
-        infra_cost=10,
-        wait_time_cost=2,
-        customer_revenue=20
+    queue_size = 100
+    initial_queue_size_distribution = np.zeros(queue_size + 1)
+    initial_queue_size_distribution[0] = 1.0  # Start with an empty queue
+    optimizer = Optimizer(
+        initial_queue_size_distribution=initial_queue_size_distribution,
+        initial_controller_gain=1.,
+        producer_lambda_function="max(10, 10*(1+sign(t-40)*exp(-(((t-300)/100)^2))))",
+        cache_models=True,
+        queue_size=queue_size,
+        infra_cost=0.1,
+        wait_time_cost=0.1,
+        customer_revenue=1.0,
+        seconds=600,
+        time_step=1e-2,
+        output_dir=output_dir
     )
-
-    output_file = output_dir / 'data.parquet'
-    sim.run(600)
-    sim.dump(str(output_file))
+    logging.info('Starting optimization')
+    logging.info(f'Initial queue size distribution: {optimizer.initial_queue_size_distribution}')
+    logging.info(f'Initial controller gain: {optimizer.initial_controller_gain}')
+    logging.info(f'Producer lambda function: {optimizer.producer_lambda_function}')
+    logging.info(f'Queue size: {optimizer.queue_size}')
+    logging.info(f'Infra cost: {optimizer.infra_cost}')
+    logging.info(f'Wait time cost: {optimizer.wait_time_cost}')
+    logging.info(f'Customer revenue: {optimizer.customer_revenue}')
+    logging.info(f'Simulation duration: {optimizer.seconds} seconds')
+    logging.info(f'Time step: {optimizer.time_step} seconds')
+    logging.info(f'Output directory: {output_dir}')
+    logging.info('Running optimization...')
+    optimizer.run()
+    logging.info('Optimization completed')
+    logging.info('Optimization results:')
+    results = optimizer.as_dict()
+    for key, value in results.items():
+        logging.info(f'{key}: {value}')
+    optimizer.dump_results()
+    logging.info(f'Results saved to {output_dir}')

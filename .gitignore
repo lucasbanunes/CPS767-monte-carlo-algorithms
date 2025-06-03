@@ -177,4 +177,4 @@ cython_debug/
 *.csv
 *.png
 *.parquet
-simulation_results/*
+**/simulation_results/**

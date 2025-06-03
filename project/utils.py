@@ -1,74 +1,17 @@
-from typing import Callable, List, Tuple
+from typing import Callable, List, Literal
 import numpy as np
-import matplotlib.pyplot as plt
 import logging
 import scipy.stats as ss
 from dataclasses import dataclass
-from functools import cache, partial
-from scipy.optimize import minimize
+from functools import lru_cache
 import pandas as pd
-
-
-def heatmap(data, row_labels=None, col_labels=None, ax=None,
-            cbar_kw=None, cbarlabel="", fontsize='medium', **kwargs):
-    """
-    Create a heatmap from a numpy array and two lists of labels.
-    https://matplotlib.org/stable/gallery/images_contours_and_fields/image_annotated_heatmap.html
-
-    Parameters
-    ----------
-    data
-        A 2D numpy array of shape (M, N).
-    row_labels
-        A list or array of length M with the labels for the rows.
-    col_labels
-        A list or array of length N with the labels for the columns.
-    ax
-        A `matplotlib.axes.Axes` instance to which the heatmap is plotted.  If
-        not provided, use current Axes or create a new one.  Optional.
-    cbar_kw
-        A dictionary with arguments to `matplotlib.Figure.colorbar`.  Optional.
-    cbarlabel
-        The label for the colorbar.  Optional.
-    **kwargs
-        All other arguments are forwarded to `imshow`.
-    """
-
-    if ax is None:
-        ax = plt.gca()
-
-    if cbar_kw is None:
-        cbar_kw = {}
-
-    # Plot the heatmap
-    im = ax.imshow(data, **kwargs)
-
-    # Create colorbar
-    cbar = ax.figure.colorbar(im, ax=ax, **cbar_kw)
-    cbar.ax.set_ylabel(cbarlabel, rotation=-90, va="bottom")
-
-    # Show all ticks and label them with the respective list entries.
-    if col_labels is not None:
-        ax.set_xticks(range(data.shape[1]), labels=col_labels,
-                      size=fontsize,
-                      rotation=-30, ha="right", rotation_mode="anchor")
-    if row_labels is not None:
-        ax.set_yticks(range(data.shape[0]), labels=row_labels,
-                      size=fontsize)
-
-    # Let the horizontal axes labeling appear on top.
-    ax.tick_params(top=True, bottom=False,
-                   labeltop=True, labelbottom=False)
-
-    # Turn spines off and create white grid.
-    ax.spines[:].set_visible(False)
-
-    ax.set_xticks(np.arange(data.shape[1]+1)-.5, minor=True)
-    ax.set_yticks(np.arange(data.shape[0]+1)-.5, minor=True)
-    ax.grid(which="minor", color="w", linestyle='-', linewidth=3)
-    ax.tick_params(which="minor", bottom=False, left=False)
-
-    return im, cbar
+from abc import ABC, abstractmethod
+from scipy.optimize import minimize
+import json
+import os
+import sympy
+from sympy.utilities.lambdify import lambdify
+from pathlib import Path
 
 
 @dataclass(frozen=True)
@@ -286,400 +229,368 @@ class TimeContinuousMarkovChainQueueModel(MarkovChainQueueModel):
 
         return transition_matrix
 
+    # def update_distribution(self, time: float, initial_state_distribution: np.ndarray) -> np.ndarray:
+    #     """
+    #     Update the state distribution based on the transition matrix.
+    #     """
+    #     return state_distribution @ self.transition_matrix
+
 
 def total_variation(u, v):
     return .5*np.sum(np.abs(u-v))
 
 
-def operation_profit(
-    infra_costs: float,
-    reject_prob: float,
-    wait_time: float,
-    producer_lambda: float,
-    customer_revenue: float,
-    wait_time_cost: float,
-):
-    revenue = customer_revenue*producer_lambda*(1 - reject_prob)
-    costs = infra_costs + wait_time_cost*wait_time
-    return revenue - costs
-
-
-def infra_lambda(
-    machines: np.ndarray,
-    machines_lambda: np.ndarray
-) -> float:
-    """
-    Calculate the total lambda of the infrastructure based on the number of machines
-    and their individual lambda values.
-    """
-    return np.dot(machines, machines_lambda)
-
-
-def infra_cost(
-    machines: np.ndarray,
-    operation_cost: np.ndarray
-) -> float:
-    """
-    Calculate the total cost of the infrastructure based on the number of machines
-    and their individual operation costs.
-    """
-    return np.dot(machines, operation_cost)
-
-
-@cache
+@lru_cache(maxsize=10)
 def get_cached_queue_model(producer_lambda: float,
                            consumer_lambda: float,
-                           queue_size: int,
-                           discrete_time_step: float = 0.01) -> TimeContinuousMarkovChainQueueModel:
+                           size: int,
+                           time_step: float) -> TimeContinuousMarkovChainQueueModel:
     return TimeContinuousMarkovChainQueueModel(
         producer_lambda=producer_lambda,
         consumer_lambda=consumer_lambda,
-        size=queue_size,
-        time_step=discrete_time_step
+        size=size,
+        time_step=time_step
     )
 
 
-class PassThroughEstimator:
+class Estimator(ABC):
+
+    @abstractmethod
+    def __call__(self, time: float, producer_lambda: float, queue_size_distribution: np.ndarray) -> float:
+        """
+        Estimate the value based on the current time, producer lambda and queue size distribution.
+        """
+        return NotImplementedError("This method should be implemented by subclasses.")
+
+
+class PassThroughEstimator(Estimator):
     def __init__(self):
         pass
 
-    def __call__(self, time: float, input_value: float) -> float:
-        return input_value
+    def __call__(self, time: float,
+                 producer_lambda: float,
+                 queue_size_distribution: np.ndarray) -> float:
+        return producer_lambda
 
 
-class ProportionalGain:
+class Controller(ABC):
+    @abstractmethod
+    def __call__(self, time: float,
+                 producer_lambda: float,
+                 queue_size_distribution: np.ndarray) -> float:
+        """
+        Compute the control action based on the current time and input value.
+        """
+        return NotImplementedError("This method should be implemented by subclasses.")
+
+
+class ProportionalGainController(Controller):
 
     def __init__(self,
                  gain: float):
         self.gain = gain
 
-    def __call__(self, time: float, input_value: float) -> float:
-        return self.gain * input_value
-
-
-class Profit:
-
-    def __init__(self,
-                 infra_cost: float,
-                 wait_time_cost: float,
-                 customer_revenue: float):
-        self.infra_cost = infra_cost
-        self.wait_time_cost = wait_time_cost
-        self.customer_revenue = customer_revenue
-
-    def __call__(self,
-                 consumer_lambda: float,
-                 effective_producer_lambda: float,
-                 expected_wait_time: float) -> float:
-        revenue = self.customer_revenue * effective_producer_lambda
-        cost = self.infra_cost * consumer_lambda + \
-            self.wait_time_cost * expected_wait_time
-        profit = revenue - cost
-        return profit, revenue, cost
-
-    def sample_computation(
-        self,
-        consumer_lambda: float,
-        new_clients: float,
-        expected_wait_time: float
-    ) -> float:
-        """
-        Sample computation of the profit function.
-        This is a simplified version that does not take into account the
-        infrastructure costs and the wait time costs.
-        """
-        revenue = self.customer_revenue * new_clients
-        cost = self.infra_cost * consumer_lambda + \
-            self.wait_time_cost * expected_wait_time
-        profit = revenue - cost
-        return profit, revenue, cost
-
-
-class MPCGainEstimator:
-
-    def __init__(self,
-                 n_steps: int,
-                 profit_function: Callable[[float, float, float], Tuple[float, float, float]],
-                 controller_class,
-                 queue_size: int,
-                 time_step: float):
-        self.n_steps = n_steps
-        self.profit_function = profit_function
-        self.controller_class = controller_class
-        self.queue_size = queue_size
-        self.time_step = time_step
-
-    def _cost_function(self,
-                       controller_params: np.ndarray,
-                       producer_lambda_hat: float,
-                       start_queue_size: int) -> float:
-        controller = self.controller_class(gain=controller_params[0])
-        queue_size_distribution = np.zeros(self.queue_size + 1)
-        queue_size_distribution[start_queue_size] = 1.0
-        current_queue_size_distribution = queue_size_distribution
-        estimated_cost = 0
-        estimated_revenue = 0
-        estimated_profit = 0
-        logging.debug(
-            f'Starting cost function computation with controller params: {controller_params}  for {self.n_steps} steps')
-        for current_step in range(self.n_steps):
-            logging.debug(f'Running step {current_step}')
-            current_time = current_step * self.time_step
-            consumer_lambda = controller(current_time, producer_lambda_hat)
-            queue_model = TimeContinuousMarkovChainQueueModel(
-                producer_lambda=producer_lambda_hat,
-                consumer_lambda=consumer_lambda,
-                size=self.queue_size,
-                time_step=self.time_step
-            )
-            reject_prob = current_queue_size_distribution[-1]
-            effective_producer_lambda_hat = producer_lambda_hat * \
-                (1 - reject_prob)
-            expected_queue_size = np.dot(
-                np.arange(self.queue_size + 1),
-                current_queue_size_distribution
-            )
-            expected_wait_time = expected_queue_size / effective_producer_lambda_hat
-            profit, revenue, cost = self.profit_function(
-                consumer_lambda, effective_producer_lambda_hat, expected_wait_time
-            )
-            estimated_profit += profit * self.time_step
-            estimated_revenue += revenue * self.time_step
-            estimated_cost += cost * self.time_step
-            current_queue_size_distribution =\
-                queue_model.discrete.update_distribution(
-                    current_queue_size_distribution)
-
-        return -estimated_profit
-
     def __call__(self, time: float,
-                 producer_lambda_hat: float,
-                 current_gain: float,
-                 current_queue_size: int) -> float:
-
-        cost_function = partial(
-            self._cost_function,
-            producer_lambda_hat=producer_lambda_hat,
-            start_queue_size=current_queue_size
-        )
-        logging.debug(f'Runing optimization for time {time} with initial gain {current_gain}')
-        res = minimize(
-            cost_function,
-            x0=current_gain,
-            method='Nelder-Mead',
-            options={'xatol': 1e-8}
-        )
-        if not res.success:
-            logging.warning(
-                f"Optimization failed at time {time}: {res.message}")
-            return current_gain
-
-        controller = self.controller_class(res.x)
-        consumer_lambda = controller(time, producer_lambda_hat)
-
-        return consumer_lambda, res.x, -res.func
-
-
-# class Optimizer:
-
-#     def __init__(self,
-#                  seconds: float,
-#                  profit_function: Callable[[float, float, float], Tuple[float, float, float]],
-#                  controller_class,
-#                  queue_size: int,
-#                  time_step: float,
-#                  producer_lambda_function: Callable[[float], float],
-#                  producer_lambda_estimator: Callable[[float, float], float]):
-#         self.n_steps = seconds
-#         self.profit_function = profit_function
-#         self.controller_class = controller_class
-#         self.queue_size = queue_size
-#         self.time_step = time_step
-#         self.n_steps = int(seconds / time_step)
-#         self.producer_lambda_function = producer_lambda_function
-#         self.producer_lambda_estimator = producer_lambda_estimator
-        
-
-#     def cost_function(self,
-#                       controller_params: np.ndarray,
-#                       producer_lambda_estimator: float,
-#                       start_queue_size: int) -> float:
-#         controller = self.controller_class(gain=controller_params[0])
-#         queue_size_distribution = np.zeros(self.queue_size + 1)
-#         queue_size_distribution[start_queue_size] = 1.0
-#         current_queue_size_distribution = queue_size_distribution
-#         estimated_cost = 0
-#         estimated_revenue = 0
-#         estimated_profit = 0
-#         logging.debug(
-#             f'Starting cost function computation with controller params: {controller_params}  for {self.n_steps} steps')
-#         for current_step in range(self.n_steps):
-#             logging.debug(f'Running step {current_step}')
-#             current_time = current_step * self.time_step
-#             cur
-#             current_producer_lambda_hat = self.producer_lambda_estimator(time, )
-#             consumer_lambda = controller(current_time, producer_lambda_hat)
-#             queue_model = TimeContinuousMarkovChainQueueModel(
-#                 producer_lambda=producer_lambda_hat,
-#                 consumer_lambda=consumer_lambda,
-#                 size=self.queue_size,
-#                 time_step=self.time_step
-#             )
-#             reject_prob = current_queue_size_distribution[-1]
-#             effective_producer_lambda_hat = producer_lambda_hat * \
-#                 (1 - reject_prob)
-#             expected_queue_size = np.dot(
-#                 np.arange(self.queue_size + 1),
-#                 current_queue_size_distribution
-#             )
-#             expected_wait_time = expected_queue_size / effective_producer_lambda_hat
-#             profit, revenue, cost = self.profit_function(
-#                 consumer_lambda, effective_producer_lambda_hat, expected_wait_time
-#             )
-#             estimated_profit += profit * self.time_step
-#             estimated_revenue += revenue * self.time_step
-#             estimated_cost += cost * self.time_step
-#             current_queue_size_distribution =\
-#                 queue_model.discrete.update_distribution(
-#                     current_queue_size_distribution)
-
-#         return -estimated_profit
-
-#     def minimize(self, time: float,
-#                  producer_lambda_hat: float,
-#                  current_gain: float,
-#                  current_queue_size: int) -> float:
-
-#         cost_function = partial(
-#             self._cost_function,
-#             producer_lambda_hat=producer_lambda_hat,
-#             start_queue_size=current_queue_size
-#         )
-#         logging.debug(f'Runing optimization for time {time} with initial gain {current_gain}')
-#         res = minimize(
-#             cost_function,
-#             x0=current_gain,
-#             method='Nelder-Mead',
-#             options={'xatol': 1e-8}
-#         )
-#         if not res.success:
-#             logging.warning(
-#                 f"Optimization failed at time {time}: {res.message}")
-#             return current_gain
-
-#         controller = self.controller_class(res.x)
-#         consumer_lambda = controller(time, producer_lambda_hat)
-
-#         return consumer_lambda, res.x, -res.func
+                 producer_lambda: float,
+                 queue_size_distribution: np.ndarray) -> float:
+        return self.gain * producer_lambda
 
 
 class Simulation:
     def __init__(self,
-                 initial_queue_size: int,
+                 initial_queue_size_distribution: np.ndarray,
                  queue_size: int,
                  time_step: float,
                  producer_lambda_function: Callable[[float], float],
-                 controller_window: float,
+                 producer_lambda_estimator: Estimator,
+                 controller: Controller,
                  infra_cost: float,
                  wait_time_cost: float,
                  customer_revenue: float,
-                 start_controller_gain: float = 1.0):
-        self.initial_queue_size = initial_queue_size
+                 cache_models: bool = False):
+        self.initial_queue_size_distribution = initial_queue_size_distribution
         self.queue_size = queue_size
         self.time_step = time_step
         self.producer_lambda_function = producer_lambda_function
+        self.producer_lambda_estimator = producer_lambda_estimator
+        self.controller = controller
         self.infra_cost = infra_cost
         self.wait_time_cost = wait_time_cost
         self.customer_revenue = customer_revenue
-        self.start_controller_gain = start_controller_gain
-        self.profit_function = Profit(
-            infra_cost=infra_cost,
-            wait_time_cost=wait_time_cost,
-            customer_revenue=customer_revenue
-        )
-        self.controller_steps = int(controller_window / time_step)
-        self.controller = MPCGainEstimator(
-            n_steps=self.controller_steps,
-            profit_function=self.profit_function,
-            controller_class=ProportionalGain,
-            queue_size=queue_size,
-            time_step=self.time_step
-        )
+        self.cache_models = cache_models
+        if cache_models:
+            self.get_queue_model = get_cached_queue_model
+        else:
+            self.get_queue_model = TimeContinuousMarkovChainQueueModel
 
         # Records
         self.time: List[float] = []
-        self.queue_size: List[int] = []
+        self.queue_size_distribuition: List[int] = []
         self.producer_lambda: List[float] = []
         self.producer_lambda_hat: List[float] = []
+        self.effective_producer_lambda: List[float] = []
         self.consumer_lambda: List[float] = []
-        self.expected_wait_time: List[float] = []
-        self.controller_gain: List[float] = []
         self.profit: List[float] = []
+        self.cost: List[float] = []
+        self.revenue: List[float] = []
+        self.reject_prob: List[float] = []
+        self.integrated_profit: List[float] = []
+        self.integrated_revenue: List[float] = []
+        self.integrated_cost: List[float] = []
+        self.expected_queue_size: List[float] = []
+        self.expected_wait_time: List[float] = []
 
     def run(self, seconds: float):
-        current_step = 0
         current_time = 0
-        current_queue_size = self.initial_queue_size
-        current_controller_gain = self.start_controller_gain
+        current_integrated_profit = 0
+        current_integrated_revenue = 0
+        current_integrated_cost = 0
+        current_queue_size_distribution = self.initial_queue_size_distribution
 
         n_steps = int(seconds / self.time_step)
         for current_step in range(n_steps):
             current_time = current_step * self.time_step
             logging.debug(f'{current_step} - Running time {current_time}')
             self.time.append(current_time)
+            self.queue_size_distribuition.append(
+                current_queue_size_distribution)
+            current_reject_prob = current_queue_size_distribution[-1]
+            self.reject_prob.append(current_reject_prob)
 
-            self.queue_size.append(current_queue_size)
+            current_expected_queue_size = np.dot(
+                np.arange(len(current_queue_size_distribution)),
+                current_queue_size_distribution
+            )
+            self.expected_queue_size.append(current_expected_queue_size)
 
             current_producer_lambda = self.producer_lambda_function(
                 current_time)
+            logging.debug(f'Current producer lambda: {current_producer_lambda}')
             self.producer_lambda.append(current_producer_lambda)
-            current_producer_lambda_hat = current_producer_lambda
+            current_effective_producer_lambda = current_producer_lambda * (
+                1 - current_reject_prob)
+            self.effective_producer_lambda.append(
+                current_effective_producer_lambda)
+            current_expected_wait_time = current_expected_queue_size / \
+                current_effective_producer_lambda
+            self.expected_wait_time.append(current_expected_wait_time)
+
+            current_producer_lambda_hat = self.producer_lambda_estimator(
+                current_time, current_producer_lambda, current_queue_size_distribution)
             self.producer_lambda_hat.append(current_producer_lambda_hat)
 
-            current_consumer_lambda, controller_params, profit = self.controller(
-                time=current_time,
-                producer_lambda_hat=current_producer_lambda_hat,
-                current_gain=current_controller_gain,
-                current_queue_size=current_queue_size)
-            current_controller_gain = controller_params[0]
+            current_consumer_lambda = self.controller(
+                current_time, current_producer_lambda_hat, current_queue_size_distribution)
             self.consumer_lambda.append(current_consumer_lambda)
-            self.profit.append(profit)
-            expected_wait_time = current_queue_size / current_consumer_lambda
-            self.expected_wait_time.append(expected_wait_time)
-            self.controller_gain.append(current_controller_gain)
 
-            # new_clients = ss.poisson.rvs(
-            #     self.time_step * current_producer_lambda_hat, 1
-            # )
-            # processed_clients = ss.poisson.rvs(
-            #     self.time_step * current_consumer_lambda, 1
-            # )
+            current_profit, current_revenue, current_cost = self.profit_function(
+                consumer_lambda=current_consumer_lambda,
+                effective_producer_lambda=current_effective_producer_lambda,
+                expected_wait_time=current_expected_wait_time
+            )
+            self.profit.append(current_profit)
+            self.revenue.append(current_revenue)
+            self.cost.append(current_cost)
 
-            # current_profit, current_revenue, current_cost = \
-            #     self.profit_function.sample_computation(
-            #         consumer_lambda=current_consumer_lambda,
-            #         effective_producer_lambda=current_producer_lambda_hat,
-            #         expected_wait_time=expected_wait_time
-            #     )
+            current_integrated_profit += current_profit * self.time_step
+            current_integrated_revenue += current_revenue * self.time_step
+            current_integrated_cost += current_cost * self.time_step
+            self.integrated_profit.append(current_integrated_profit)
+            self.integrated_revenue.append(current_integrated_revenue)
+            self.integrated_cost.append(current_integrated_cost)
 
-            queue_model = get_cached_queue_model(
+            queue_model = self.get_queue_model(
                 producer_lambda=current_producer_lambda,
                 consumer_lambda=current_consumer_lambda,
-                queue_size=self.queue_size
+                size=self.queue_size,
+                time_step=self.time_step
             )
+            current_queue_size_distribution = queue_model.discrete.update_distribution(
+                current_queue_size_distribution)
 
-            current_queue_size = queue_model.update_state(current_queue_size)
+        return self.integrated_profit[-1]
+
+    def profit_function(self,
+                        consumer_lambda: float,
+                        effective_producer_lambda: float,
+                        expected_wait_time: float) -> float:
+
+        revenue = self.customer_revenue * effective_producer_lambda
+        cost = self.infra_cost * consumer_lambda + \
+            self.wait_time_cost * expected_wait_time
+        profit = revenue - cost
+        return profit, revenue, cost
 
     def dump_results(self, filename: str):
         results_df = dict(
             time=self.time,
-            queue_size=self.queue_size,
+            queue_size_distribuition=self.queue_size_distribuition,
             producer_lambda=self.producer_lambda,
             producer_lambda_hat=self.producer_lambda_hat,
+            effective_producer_lambda=self.effective_producer_lambda,
             consumer_lambda=self.consumer_lambda,
+            profit=self.profit,
+            cost=self.cost,
+            revenue=self.revenue,
+            reject_prob=self.reject_prob,
+            integrated_profit=self.integrated_profit,
+            integrated_revenue=self.integrated_revenue,
+            integrated_cost=self.integrated_cost,
+            expected_queue_size=self.expected_queue_size,
             expected_wait_time=self.expected_wait_time,
-            controller_gain=self.controller_gain,
-            profit=self.profit
         )
         results_df = pd.DataFrame.from_dict(results_df)
         results_df.to_parquet(filename)
+
+
+class Optimizer:
+
+    def __init__(self,
+                 initial_queue_size_distribution: np.ndarray,
+                 initial_controller_gain: float,
+                 producer_lambda_function: str | Callable[[float], float],
+                 queue_size: int,
+                 infra_cost: float,
+                 wait_time_cost: float,
+                 customer_revenue: float,
+                 seconds: float,
+                 time_step: float,
+                 output_dir: str,
+                 cache_models: bool = False):
+        self.initial_queue_size_distribution = initial_queue_size_distribution
+        self.initial_controller_gain = initial_controller_gain
+        if isinstance(producer_lambda_function, str):
+            self.producer_lambda_function = producer_lambda_function
+            sympy_locals = dict(t=sympy.Symbol("t", real=True))
+            sym_func = sympy.sympify(producer_lambda_function, locals=sympy_locals)
+            self.producer_lambda_callable = lambdify(
+                "t", sym_func, modules="numpy")
+        else:
+            self.producer_lambda_function = "Not a string"
+            self.producer_lambda_callable = producer_lambda_function
+        self.queue_size = queue_size
+        self.infra_cost = infra_cost
+        self.wait_time_cost = wait_time_cost
+        self.customer_revenue = customer_revenue
+        self.seconds = seconds
+        self.time_step = time_step
+        self.output_dir = output_dir
+        self.cache_models = cache_models
+
+        self.controller_gain: List[float] = []
+        self.costs: List[float] = []
+        self.call_counter = 0
+        self.result = None
+
+    def cost_function(self, x: np.ndarray) -> float:
+        controller_gain = x[0]
+        logging.info(
+            f'Optimizer call {self.call_counter} with controller_gain={controller_gain}')
+        self.controller_gain.append(float(controller_gain))
+        controller = ProportionalGainController(gain=controller_gain)
+        sim = Simulation(
+            initial_queue_size_distribution=self.initial_queue_size_distribution,
+            queue_size=self.queue_size,
+            time_step=self.time_step,
+            producer_lambda_function=self.producer_lambda_callable,
+            producer_lambda_estimator=PassThroughEstimator(),
+            controller=controller,
+            infra_cost=self.infra_cost,
+            wait_time_cost=self.wait_time_cost,
+            customer_revenue=self.customer_revenue,
+            cache_models=self.cache_models
+        )
+        cost = -sim.run(self.seconds)
+        self.costs.append(float(cost))
+        self.call_counter += 1
+        if self.output_dir:
+            sim.dump_results(
+                f'{self.output_dir}/simulation_{self.call_counter:03}.parquet')
+        return cost
+
+    def run(self):
+        numpy_result = minimize(
+            self.cost_function,
+            x0=np.array([self.initial_controller_gain]),
+            method='Nelder-Mead',
+            options={'maxiter': 100, 'xatol': 1e-8}
+        )
+        self._set_numpy_result(numpy_result)
+        return self.result
+
+    def _set_numpy_result(self, result):
+        self.result = dict(
+            x=float(result.x[0]),
+            fun=float(result.fun),
+            status=result.status,
+            success=result.success,
+            message=result.message,
+            nfev=result.nfev,
+            nit=result.nit
+        )
+
+    def as_dict(self):
+        return dict(
+            controller_gain=self.controller_gain,
+            costs=self.costs,
+            initial_queue_size_distribution=self.initial_queue_size_distribution.tolist(),
+            initial_controller_gain=float(self.initial_controller_gain),
+            producer_lambda_function=self.producer_lambda_function,
+            queue_size=float(self.queue_size),
+            infra_cost=float(self.infra_cost),
+            wait_time_cost=float(self.wait_time_cost),
+            customer_revenue=float(self.customer_revenue),
+            seconds=float(self.seconds),
+            time_step=float(self.time_step),
+            call_counter=self.call_counter,
+            result=self.result
+        )
+
+    def dump_results(self):
+        if not self.output_dir:
+            raise ValueError(
+                "Output directory is not set. Cannot dump results.")
+        filename = os.path.join(self.output_dir, 'optimization_results.json')
+        with open(filename, 'w') as f:
+            json.dump(self.as_dict(), f, indent=4)
+
+    @classmethod
+    def from_dir(cls, output_dir: str | Path) -> 'Optimizer':
+        if isinstance(output_dir, str):
+            with open(os.path.join(output_dir, 'optimization_results.json'), 'r') as f:
+                data = json.load(f)
+        elif isinstance(output_dir, Path):
+            with open(output_dir / 'optimization_results.json', 'r') as f:
+                data = json.load(f)
+        else:
+            raise ValueError("output_dir must be a string or Path object.")
+        instance = cls(
+            initial_queue_size_distribution=np.array(data['initial_queue_size_distribution']),
+            initial_controller_gain=data['initial_controller_gain'],
+            producer_lambda_function=data['producer_lambda_function'],
+            queue_size=data['queue_size'],
+            infra_cost=data['infra_cost'],
+            wait_time_cost=data['wait_time_cost'],
+            customer_revenue=data['customer_revenue'],
+            seconds=data['seconds'],
+            time_step=data['time_step'],
+            output_dir=output_dir
+        )
+        instance.controller_gain = np.array(data['controller_gain'])
+        instance.costs = np.array(data['costs'])
+        instance.call_counter = data['call_counter']
+        instance.result = data['result']
+        return instance
+
+    def get_sim(self, iteration: int | Literal['best', 'worst']) -> pd.DataFrame:
+        """
+        Get the simulation results for a specific iteration.
+        """
+        if not self.output_dir:
+            raise ValueError("Output directory is not set. Cannot get simulation results.")
+        if iteration == 'best':
+            iteration = np.argmin(self.costs)
+        elif iteration == 'worst':
+            iteration = np.argmax(self.costs)
+        filename = os.path.join(self.output_dir, f'simulation_{iteration:03}.parquet')
+        return pd.read_parquet(filename)
