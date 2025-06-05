@@ -58,7 +58,6 @@ def run_optimization(job_id: int,
                      arrival_rate_function: str,
                      arrival_rate_revenue: float,
                      cloud_service_rate_cost: float,
-                     effective_arrival_rate_penalty: float,
                      xatol: float = 1e-5,
                      seconds: float = 600,
                      base_output_dir: str = '.') -> dict:
@@ -72,6 +71,9 @@ def run_optimization(job_id: int,
         )
 
     output_dir = Path(base_output_dir) / f'job_{job_id}'
+    if output_dir.exists():
+        print(f'Output directory {output_dir} already exists. Skipping job {job_id}.')
+        return
     output_dir.mkdir(parents=True, exist_ok=True)
     log_filename = output_dir / 'job.log'
     logging.config.dictConfig(get_logging_config('INFO', str(log_filename)))
@@ -88,7 +90,6 @@ def run_optimization(job_id: int,
         arrtival_rate_estimator=PassThroughEstimator(),
         arrival_rate_revenue=arrival_rate_revenue,
         cloud_service_rate_cost=cloud_service_rate_cost,
-        effective_arrival_rate_penalty=effective_arrival_rate_penalty,
         seconds=seconds,
         output_dir=output_dir,
         solve_ivp_kwargs={
@@ -110,7 +111,6 @@ def run_optimization(job_id: int,
     logging.info(f'optimizer.controller_builder: {optimizer.controller_builder}')
     logging.info(f'optimizer.arrival_rate_revenue: {optimizer.arrival_rate_revenue}')
     logging.info(f'optimizer.cloud_service_rate_cost: {optimizer.cloud_service_rate_cost}')
-    logging.info(f'optimizer.effective_arrival_rate_penalty: {optimizer.effective_arrival_rate_penalty}')
     logging.info(f'optimizer.seconds: {optimizer.seconds}')
     logging.info(f'optimizer.solve_ivp_kwargs: {optimizer.solve_ivp_kwargs}')
     logging.info(f'optimizer.minimize_kwargs: {optimizer.minimize_kwargs}')
@@ -136,57 +136,39 @@ if __name__ == '__main__':
     std = 100
     params = [
         {
+            "job_id": 'cheap_cloud_constant_demand',
             "queue_size": queue_size,
             "arrival_rate_function": "10",
             "arrival_rate_revenue": 1.0,
             "cloud_service_rate_cost": 0.1,
-            "effective_arrival_rate_penalty": 0.1,
             "base_output_dir": str(base_output_dir),
         },
         {
+            "job_id": 'expensive_cloud_constant_demand',
             "queue_size": queue_size,
             "arrival_rate_function": "10",
             "arrival_rate_revenue": 1.0,
             "cloud_service_rate_cost": 0.5,
-            "effective_arrival_rate_penalty": 0.1,
             "base_output_dir": str(base_output_dir),
         },
         {
-            "queue_size": queue_size,
-            "arrival_rate_function": "10",
-            "arrival_rate_revenue": 1.0,
-            "cloud_service_rate_cost": 0.1,
-            "effective_arrival_rate_penalty": 0.5,
-            "base_output_dir": str(base_output_dir),
-        },
-        {
+            "job_id": 'cheap_cloud_normal_dist_demand',
             "queue_size": queue_size,
             "arrival_rate_function": f"10*(1+250*{normal_distribution_str("t", mean, std)})",
             "arrival_rate_revenue": 1.0,
             "cloud_service_rate_cost": 0.1,
-            "effective_arrival_rate_penalty": 0.1,
             "base_output_dir": str(base_output_dir),
         },
         {
+            "job_id": 'expensive_cloud_normal_dist_demand',
             "queue_size": queue_size,
             "arrival_rate_function": f"10*(1+250*{normal_distribution_str("t", mean, std)})",
             "arrival_rate_revenue": 1.0,
             "cloud_service_rate_cost": 0.5,
-            "effective_arrival_rate_penalty": 0.1,
-            "base_output_dir": str(base_output_dir),
-        },
-        {
-            "queue_size": queue_size,
-            "arrival_rate_function": f"10*(1+250*{normal_distribution_str("t", mean, std)})",
-            "arrival_rate_revenue": 1.0,
-            "cloud_service_rate_cost": 0.1,
-            "effective_arrival_rate_penalty": 0.5,
             "base_output_dir": str(base_output_dir),
         },
     ]
 
     pool = Parallel(n_jobs=-1)
-    pool(
-        delayed(run_optimization)(job_id=i, **param) for i, param in enumerate(params)
-    )
+    pool(delayed(run_optimization)(**param) for param in params)
     print("Simulation script completed")

@@ -219,7 +219,7 @@ class ProportionalGainController(Controller):
 class CloudDynamics(ABC):
     @abstractmethod
     def __call__(self, time: float,
-                 desired_service_rate: float,
+                 requested_service_rate: float,
                  queue_size_distribution: np.ndarray) -> float:
         """
         Compute the cloud dynamics based on the desired service rate and the
@@ -233,9 +233,9 @@ class InstantaneousCloudDynamics(CloudDynamics):
         pass
 
     def __call__(self, time: float,
-                 desired_service_rate: float,
+                 requested_service_rate: float,
                  queue_size_distribution: np.ndarray) -> float:
-        return desired_service_rate
+        return requested_service_rate
 
 
 class DeployDynamics(ABC):
@@ -299,7 +299,6 @@ class Simulation:
                  arrtival_rate_estimator: ArrivalRateEstimator,
                  arrival_rate_revenue: float,
                  cloud_service_rate_cost: float,
-                 effective_arrival_rate_penalty: float,
                  solve_ivp_kwargs: Dict[str, Any] = {},):
         self.initial_queue_size_distribution = initial_queue_size_distribution
         self.queue_size = queue_size
@@ -311,7 +310,6 @@ class Simulation:
         self.arrtival_rate_estimator = arrtival_rate_estimator
         self.arrival_rate_revenue = arrival_rate_revenue
         self.cloud_service_rate_cost = cloud_service_rate_cost
-        self.effective_arrival_rate_penalty = effective_arrival_rate_penalty
         self.solve_ivp_kwargs = solve_ivp_kwargs
 
         if self.solve_ivp_kwargs.get('method') is None:
@@ -320,10 +318,8 @@ class Simulation:
         if self.solve_ivp_kwargs.get('max_step') is None:
             self.solve_ivp_kwargs['max_step'] = 1e-2
 
-    def operation_cost(self, cloud_service_rate: float,
-                       effective_arrival_rate: float) -> float:
-        return self.cloud_service_rate_cost * cloud_service_rate + \
-            self.effective_arrival_rate_penalty/effective_arrival_rate
+    def operation_cost(self, cloud_service_rate: float) -> float:
+        return self.cloud_service_rate_cost * cloud_service_rate
 
     def operation_revenue(self, effective_arrival_rate: float) -> float:
         return self.arrival_rate_revenue * effective_arrival_rate
@@ -337,11 +333,11 @@ class Simulation:
         estimated_arrival_rate = self.arrtival_rate_estimator(
             time, arrival_rate, queue_size_distribution)
 
-        desired_service_rate = self.controller(
+        requested_service_rate = self.controller(
             time, estimated_arrival_rate, queue_size_distribution)
 
         cloud_service_rate = self.cloud_dynamics(
-            time, desired_service_rate, queue_size_distribution)
+            time, requested_service_rate, queue_size_distribution)
 
         deploy_service_rate = self.deploy_dynamics(
             time, cloud_service_rate, queue_size_distribution)
@@ -352,8 +348,7 @@ class Simulation:
         )
 
         cost = self.operation_cost(
-            cloud_service_rate=cloud_service_rate,
-            effective_arrival_rate=effective_arrival_rate
+            cloud_service_rate=cloud_service_rate
         )
         revenue = self.operation_revenue(
             effective_arrival_rate=effective_arrival_rate
@@ -384,7 +379,7 @@ class Simulation:
             'arrival_rate',
             'estimated_arrival_rate',
             'effective_arrival_rate',
-            'desired_service_rate',
+            'requested_service_rate',
             'cloud_service_rate',
             'deploy_service_rate',
             'cost',
@@ -408,7 +403,7 @@ class Simulation:
         results['arrival_rate'] = np.nan
         results['estimated_arrival_rate'] = np.nan
         results['effective_arrival_rate'] = np.nan
-        results['desired_service_rate'] = np.nan
+        results['requested_service_rate'] = np.nan
         results['cloud_service_rate'] = np.nan
         results['deploy_service_rate'] = np.nan
         results['cost'] = np.nan
@@ -430,14 +425,14 @@ class Simulation:
                 results.loc[i, 'arrival_rate'],
                 queue_size_distribution
             )
-            results.loc[i, 'desired_service_rate'] = self.controller(
+            results.loc[i, 'requested_service_rate'] = self.controller(
                 time,
                 results.loc[i, 'estimated_arrival_rate'],
                 queue_size_distribution
             )
             results.loc[i, 'cloud_service_rate'] = self.cloud_dynamics(
                 time,
-                results.loc[i, 'desired_service_rate'],
+                results.loc[i, 'requested_service_rate'],
                 queue_size_distribution
             )
             results.loc[i, 'deploy_service_rate'] = self.deploy_dynamics(
@@ -457,8 +452,7 @@ class Simulation:
                 effective_arrival_rate=results.loc[i, 'effective_arrival_rate']
             )
             results.loc[i, 'cost'] = self.operation_cost(
-                cloud_service_rate=results.loc[i, 'cloud_service_rate'],
-                effective_arrival_rate=results.loc[i, 'effective_arrival_rate']
+                cloud_service_rate=results.loc[i, 'cloud_service_rate']
             )
             results.loc[i, 'revenue'] = self.operation_revenue(
                 effective_arrival_rate=results.loc[i, 'effective_arrival_rate']
@@ -483,7 +477,6 @@ class OptimizedControl:
                  arrtival_rate_estimator: ArrivalRateEstimator,
                  arrival_rate_revenue: float,
                  cloud_service_rate_cost: float,
-                 effective_arrival_rate_penalty: float,
                  seconds: float,
                  output_dir: str | Path | None,
                  solve_ivp_kwargs: Dict[str, Any] = {},
@@ -497,7 +490,6 @@ class OptimizedControl:
         self.arrtival_rate_estimator = arrtival_rate_estimator
         self.arrival_rate_revenue = arrival_rate_revenue
         self.cloud_service_rate_cost = cloud_service_rate_cost
-        self.effective_arrival_rate_penalty = effective_arrival_rate_penalty
         self.seconds = seconds
         self.solve_ivp_kwargs = solve_ivp_kwargs
         self.minimize_kwargs = minimize_kwargs
@@ -520,7 +512,7 @@ class OptimizedControl:
         self._solution: np.ndarray = []
 
     def cost_function(self, controller_params: np.ndarray) -> float:
-        logging.debug(
+        logging.info(
             f"{self._call_counter} - Running cost function with controller params: {controller_params}")
         simulation = Simulation(
             initial_queue_size_distribution=self.initial_queue_size_distribution,
@@ -533,7 +525,6 @@ class OptimizedControl:
             arrtival_rate_estimator=self.arrtival_rate_estimator,
             arrival_rate_revenue=self.arrival_rate_revenue,
             cloud_service_rate_cost=self.cloud_service_rate_cost,
-            effective_arrival_rate_penalty=self.effective_arrival_rate_penalty,
             solve_ivp_kwargs=self.solve_ivp_kwargs
         )
         simulation_result = simulation.run(seconds=self.seconds)
@@ -577,8 +568,6 @@ class OptimizedControl:
             initial_queue_size_distribution=self.initial_queue_size_distribution.tolist(),
             initial_controller_params=self._initial_controller_params.tolist(),
             cloud_service_rate_cost=float(self.cloud_service_rate_cost),
-            effective_arrival_rate_penalty=float(
-                self.effective_arrival_rate_penalty),
             arrival_rate_revenue=float(self.arrival_rate_revenue),
             seconds=float(self.seconds),
             call_counter=self._call_counter,
@@ -602,7 +591,6 @@ class OptimizedControlResults:
     initial_queue_size_distribution: List[float]
     initial_controller_params: List[float]
     cloud_service_rate_cost: float
-    effective_arrival_rate_penalty: float
     arrival_rate_revenue: float
     seconds: float
     call_counter: int
@@ -616,7 +604,6 @@ class OptimizedControlResults:
                  initial_queue_size_distribution: ArrayLike,
                  initial_controller_params: ArrayLike,
                  cloud_service_rate_cost: float,
-                 effective_arrival_rate_penalty: float,
                  arrival_rate_revenue: float,
                  seconds: float,
                  call_counter: int,
@@ -633,7 +620,6 @@ class OptimizedControlResults:
         if not isinstance(initial_controller_params, np.ndarray):
             self.initial_controller_params = np.array(initial_controller_params)
         self.cloud_service_rate_cost = cloud_service_rate_cost
-        self.effective_arrival_rate_penalty = effective_arrival_rate_penalty
         self.arrival_rate_revenue = arrival_rate_revenue
         self.seconds = seconds
         self.call_counter = call_counter
@@ -649,7 +635,6 @@ class OptimizedControlResults:
             initial_queue_size_distribution=data['initial_queue_size_distribution'],
             initial_controller_params=data['initial_controller_params'],
             cloud_service_rate_cost=data['cloud_service_rate_cost'],
-            effective_arrival_rate_penalty=data['effective_arrival_rate_penalty'],
             arrival_rate_revenue=data['arrival_rate_revenue'],
             seconds=data['seconds'],
             call_counter=data['call_counter'],
