@@ -1,7 +1,7 @@
 
 from typing import Any, Callable, Dict, List
 import numpy as np
-from numpy.typing import ArrayLike
+from numpy.typing import ArrayLike, NDArray
 import logging
 from scipy import linalg, integrate, optimize, stats
 from functools import cached_property
@@ -12,6 +12,57 @@ import os
 import sympy
 from sympy.utilities.lambdify import lambdify
 from pathlib import Path
+from sklearn.linear_model import LinearRegression
+
+
+def exponential_regression(x: NDArray[np.floating],
+                           y: NDArray[np.floating],
+                           sample_weight: NDArray[np.floating] | None = None
+                           ) -> tuple[float, float, LinearRegression]:
+    """
+    Returns the parameters of an exponential regression model fitted to the data.
+    The model is of the form y = A * exp(b * x), where A is the intercept and b is the slope
+    of the equivalent linear model log(y) = A + b * x.
+
+    Parameters
+    ----------
+    x : NDArray[np.floating]
+        x values of the data points.
+    y : NDArray[np.floating]
+        y values of the data points.
+
+    Returns
+    -------
+    tuple[float, float, LinearRegression]
+        A tuple containing the intercept (A), slope (b) of the linearized model,
+        and the fitted LinearRegression model.
+    """
+    y = np.log(y)
+    model = LinearRegression()
+    model.fit(x, y, sample_weight)
+    A = model.intercept_
+    b = model.coef_[0]
+    return A, b, model
+
+
+class PoissonProcess:
+    def __init__(self, rate: float, size: int):
+        """
+        Initialize the Poisson process with the given rate.
+        """
+        self.rate = rate
+        self.size = size
+        self.inter_arrival_time_distribution = stats.expon(scale=1/rate)
+
+    @cached_property
+    def rate_matrix(self) -> NDArray[np.floating]:
+        rate_matrix = np.zeros(
+            (self.size + 1, self.size + 1))  # States from 0 to size
+        states = np.arange(self.size + 1)  # States from 0 to size
+        rate_matrix[states[:-1], states[:-1]] = -self.rate
+
+        rate_matrix[states[:-1], states[1:]] = self.rate
+        return rate_matrix
 
 
 class LimitedSizeMarkovChainQueueModel(ABC):
@@ -128,7 +179,7 @@ class SimpleMarkovChainQueueModel(LimitedSizeMarkovChainQueueModel):
         rate_sum = self.arrival_rate + self.service_rate
         self.increase_prob = self.arrival_rate / rate_sum
         self.decrease_prob = self.arrival_rate / rate_sum
-        self.service_arrival = self.service_rate / self.arrival_rate
+        self.arrival_service = self.arrival_rate / self.service_rate
 
     @cached_property
     def stationary_distribution(self) -> np.ndarray:
@@ -137,16 +188,16 @@ class SimpleMarkovChainQueueModel(LimitedSizeMarkovChainQueueModel):
         The continuous stationary distribution is a vector of size (size + 1)
         where each element corresponds to the probability of being in that state.
         """
-        if self.service_arrival == 1:
+        if self.arrival_service == 1:
             pi_zero = 1 / (self.size + 1)
         else:
-            pi_zero = (1-self.service_arrival) / \
-                (1 - (self.service_arrival**(self.size + 1)))
+            pi_zero = (1-self.arrival_service) / \
+                (1 - (self.arrival_service**(self.size + 1)))
 
         pi = np.empty(self.size + 1)
         pi[0] = pi_zero
         for i in range(1, self.size + 1):
-            pi[i] = self.service_arrival * pi[i - 1]
+            pi[i] = self.arrival_service * pi[i - 1]
 
         return pi
 
@@ -270,15 +321,20 @@ class ArrivalRateDynamics(ABC):
         return NotImplementedError("This method should be implemented by subclasses.")
 
 
+def get_lambda_from_string(str_fun: str,
+                           variable: str = 'x'
+                           ) -> Callable[[float], float]:
+    sympy_locals = dict(t=sympy.Symbol(variable, real=True))
+    sym_func = sympy.sympify(
+        str_fun, locals=sympy_locals)
+    return lambdify(variable, sym_func, modules="numpy")
+
+
 class TimeFunctionArrivalRateDynamics(ArrivalRateDynamics):
     def __init__(self, arrival_rate_function: Callable[[float], float] | str):
         self.arrival_rate_function = arrival_rate_function
         if isinstance(self.arrival_rate_function, str):
-            sympy_locals = dict(t=sympy.Symbol("t", real=True))
-            sym_func = sympy.sympify(
-                arrival_rate_function, locals=sympy_locals)
-            self.arrival_rate_callable = lambdify(
-                "t", sym_func, modules="numpy")
+            self.arrival_rate_callable = get_lambda_from_string(arrival_rate_function, "t")
         else:
             self.arrival_rate_callable = self.arrival_rate_function
 
